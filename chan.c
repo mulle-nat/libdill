@@ -183,7 +183,7 @@ int dill_chsend(int h, const void *val, size_t len, int64_t deadline) {
     struct dill_halfchan *ch = dill_hquery(h, dill_halfchan_type);
     if(dill_slow(!ch)) return -1;
     /* Sending is always done to the opposite side of the channel. */
-    ch = dill_halfchan_other(ch);   
+    ch = dill_halfchan_other(ch);
     /* Check if the channel is done. */
     if(dill_slow(ch->done)) {errno = EPIPE; return -1;}
     /* Copy the message directly to the waiting receiver, if any. */
@@ -199,6 +199,73 @@ int dill_chsend(int h, const void *val, size_t len, int64_t deadline) {
         dill_trigger(&chcl->cl, 0);
         return 0;
     }
+    /* The clause is not available immediately. */
+    if(dill_slow(deadline == 0)) {errno = ETIMEDOUT; return -1;}
+    /* Let's wait. */
+    struct dill_chanclause chcl;
+    dill_list_insert(&chcl.item, &ch->out);
+    chcl.val = (void*)val;
+    chcl.len = len;
+    dill_waitfor(&chcl.cl, 0, dill_chcancel);
+    struct dill_tmclause tmcl;
+    dill_timer(&tmcl, 1, deadline);
+    int id = dill_wait();
+    if(dill_slow(id < 0)) return -1;
+    if(dill_slow(id == 1)) {errno = ETIMEDOUT; return -1;}
+    if(dill_slow(errno != 0)) return -1;
+    return 0;
+}
+
+/*
+ * A modifed dill_chsend
+ * that sends to all receivers.
+ * (Nat! - 2019)
+ */
+int dill_chbroadcast(int h, const void *val, size_t len, int64_t deadline) {
+    int rc = dill_canblock();
+    int have_fails;
+    struct dill_cr *first_cr;
+
+    if(dill_slow(rc < 0)) return -1;
+    /* Get the channel interface. */
+    struct dill_halfchan *ch = dill_hquery(h, dill_halfchan_type);
+    if(dill_slow(!ch)) return -1;
+    /* Sending is always done to the opposite side of the channel. */
+    ch = dill_halfchan_other(ch);
+    /* Check if the channel is done. */
+    if(dill_slow(ch->done)) {errno = EPIPE; return -1;}
+    /* Copy the message directly to the waiting receiver, if any. */
+    have_fails=0;
+    first_cr=NULL;
+    while(!dill_list_empty(&ch->in)) {
+        struct dill_chanclause *chcl = dill_cont(dill_list_next(&ch->in),
+            struct dill_chanclause, item);
+
+        /* do not call twice */
+        if( ! first_cr)
+            first_cr = &chcl->cl.cr;
+        else
+            if( first_cr == &chcl->cl.cr)
+                break;
+
+        if(dill_slow(len != chcl->len)) {
+            dill_trigger(&chcl->cl, EMSGSIZE);
+            dill_yield(); /* guarantee context switch */
+            errno = EMSGSIZE;
+            have_fails++;
+            continue;
+        }
+
+        memcpy(chcl->val, val, len);
+        dill_trigger(&chcl->cl, 0);
+        dill_yield(); /* guarantee context switch */
+    }
+    /* fail at the the end if we have any */
+    if( have_fails)
+      return -1;
+    if( first_cr)
+        return 0;
+
     /* The clause is not available immediately. */
     if(dill_slow(deadline == 0)) {errno = ETIMEDOUT; return -1;}
     /* Let's wait. */
@@ -322,7 +389,7 @@ int dill_choose(struct dill_chclause *clauses, int nclauses, int64_t deadline) {
         default:
             errno = EINVAL;
             return i;
-        } 
+        }
     }
     /* There are no clauses immediately available. */
     if(dill_slow(deadline == 0)) {errno = ETIMEDOUT; return -1;}
