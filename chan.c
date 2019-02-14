@@ -224,7 +224,6 @@ int dill_chsend(int h, const void *val, size_t len, int64_t deadline) {
 int dill_chbroadcast(int h, const void *val, size_t len, int64_t deadline) {
     int rc = dill_canblock();
     int have_fails;
-    struct dill_cr *first_cr;
 
     if(dill_slow(rc < 0)) return -1;
     /* Get the channel interface. */
@@ -236,17 +235,19 @@ int dill_chbroadcast(int h, const void *val, size_t len, int64_t deadline) {
     if(dill_slow(ch->done)) {errno = EPIPE; return -1;}
     /* Copy the message directly to the waiting receiver, if any. */
     have_fails=0;
-    first_cr=NULL;
-    while(!dill_list_empty(&ch->in)) {
-        struct dill_chanclause *chcl = dill_cont(dill_list_next(&ch->in),
-            struct dill_chanclause, item);
+    if(!dill_list_empty(&ch->in)) {
+      struct dill_list *curr, *next, *stop;
+      struct dill_chanclause *chcl;
 
-        /* do not call twice */
-        if( ! first_cr)
-            first_cr = &chcl->cl.cr;
-        else
-            if( first_cr == &chcl->cl.cr)
-                break;
+      curr = &ch->in;
+      stop = curr->prev;
+      next = dill_list_next( curr);
+
+      do
+      {
+        curr = next;
+        next = dill_list_next( curr);
+        chcl = dill_cont( curr, struct dill_chanclause, item);
 
         if(dill_slow(len != chcl->len)) {
             dill_trigger(&chcl->cl, EMSGSIZE);
@@ -259,12 +260,15 @@ int dill_chbroadcast(int h, const void *val, size_t len, int64_t deadline) {
         memcpy(chcl->val, val, len);
         dill_trigger(&chcl->cl, 0);
         dill_yield(); /* guarantee context switch */
+      }
+      while( curr != stop);
+
+      /* fail at the the end if we have any */
+      if( have_fails)
+        return -1;
+      return 0;
     }
-    /* fail at the the end if we have any */
-    if( have_fails)
-      return -1;
-    if( first_cr)
-        return 0;
+
 
     /* The clause is not available immediately. */
     if(dill_slow(deadline == 0)) {errno = ETIMEDOUT; return -1;}
